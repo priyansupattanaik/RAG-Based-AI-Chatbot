@@ -1,0 +1,8 @@
+.env
+__pycache__/
+.pytest_cache/
+.chroma_db/
+.vector_cache/
+.pdf_assets/
+.uploads/
+*.pyc

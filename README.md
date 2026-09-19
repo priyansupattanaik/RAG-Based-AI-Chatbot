@@ -1,252 +1,242 @@
-# Agentic AI Knowledge Assistant (RAG Pipeline)
+# PDF Q&A (RAG Chatbot)
 
-A production-grade, knowledge-grounded Retrieval-Augmented Generation (RAG) system built with **LangGraph**, **Pinecone**, and **Streamlit**, specifically tailored to the **"Agentic AI: An Executive's Guide"** ebook.
+Upload a PDF, then ask questions. Answers come only from that file, with page citations. Chat is locked until a PDF is uploaded and indexed.
 
----
-
-## 🎯 Requirements Fulfillment
-
-| Requirement from Specification | Implementation Details |
-|---|---|
-| **1. PDF Ingestion $\to$ Chunking $\to$ Embeddings $\to$ Pinecone** | In `ingestion.py`: PyMuPDF extracts text per page with unicode normalization and de-hyphenation, `RecursiveCharacterTextSplitter` chunks text preserving metadata (`page`, `chunk_id`, `index`), embeddings are generated (NVIDIA NIM or local `all-MiniLM-L6-v2`), and upserted into Pinecone serverless index (with high-performance disk-cached local vector store). |
-| **2. LangGraph RAG Pipeline** | In `rag_pipeline.py`: A compiled `StateGraph` with conditional routing: `retrieve` $\to$ `grade_relevance` $\to$ (if relevant $\to$ `generate` $\to$ `check_grounding` $\to$ (if grounded $\to$ `finalize`, else $\to$ `correct_answer`), else $\to$ `handle_out_of_scope`). |
-| **3. API & UI Interface** | **Streamlit UI** (`app.py`): Full-featured interactive chat interface with confidence badges, expandable chunk viewer with page badges, and sidebar configuration.<br>**FastAPI API** (`api.py`): Exposes `/chat`, `/ingest`, and `/health` endpoints. |
-| **4. Structured Response** | The pipeline returns: <br>1. **Final answer** (with page citations)<br>2. **Retrieved context chunks** (page number, similarity score, chunk ID, text)<br>3. **Confidence or score** (normalized 0.0 – 1.0 confidence score) |
+The old “ebook-only” path is gone. The bundled `Ebook-Agentic-AI.pdf` is a sample used by tests; it is **not** auto-loaded as the knowledge base.
 
 ---
 
-## 🏗️ System Architecture
+## What it does
+
+1. You upload a PDF (Streamlit sidebar or `POST /upload`).
+2. PyMuPDF extracts text, markdown tables, and figures.
+3. Chunks are embedded and stored (local disk cache by default; Chroma or Pinecone optional).
+4. A LangGraph pipeline retrieves, grades relevance, generates, checks grounding, and self-corrects.
+5. The response includes the answer, retrieved chunks, confidence, citations, tables, and images.
+
+If nothing has been uploaded, `/chat` returns **409** and the Streamlit UI stops with an error. It will not fall back to a default PDF.
+
+---
+
+## Architecture
 
 ```text
-[Ebook-Agentic-AI.pdf]
-         │
-         ▼
-[PyMuPDF Page Extraction + Unicode Normalization]
-         │
-         ▼
-[Recursive Character Chunking] (chunk_size=800, overlap=100)
-         │
-         ▼
-[Embeddings] (NVIDIA NIM / Sentence-Transformers fallback)
-         │
-         ▼
-[Pinecone Vector Store / Persisted Local Cache]
-         │
-         ▼
-┌─────────────────────── LangGraph Workflow ────────────────────────┐
-│                                                                   │
-│  [START] ──► [Retrieve Top-K Chunks]                             │
-│                      │                                            │
-│                      ▼                                            │
-│              [Grade Relevance]                                    │
-│             /                 \                                   │
-│    (is relevant)           (out of scope)                         │
-│           /                     \                                 │
-│          ▼                       ▼                                │
-│   [Grounded Generation]    [Handle Out-of-Scope] ──► [END]        │
-│          │                                                        │
-│          ▼                                                        │
-│   [Check Grounding]                                               │
-│    /             \                                                │
-│(grounded)    (ungrounded)                                         │
-│  /                 \                                              │
-│ │            [Correct Answer]                                     │
-│ │             (Self-Correction)                                   │
-│ │                  │                                              │
-│ └──► [Finalize] ◄──┘                                              │
-│          │                                                        │
-│          ▼                                                        │
-│        [END]                                                      │
-└───────────────────────────────────────────────────────────────────┘
-         │
-         ├──► Streamlit Web UI (`app.py`)
-         └──► FastAPI REST API (`api.py`)
+[User PDF upload]  ── required before any Q&A ──
+        │
+        ▼
+[PyMuPDF]  text + tables (markdown) + figures (PNG)
+        │
+        ▼
+[Chunking]  RecursiveCharacterTextSplitter  (size=800, overlap=100)
+        │
+        ▼
+[Embeddings]  NVIDIA NIM  or  local sentence-transformers (all-MiniLM-L6-v2)
+        │
+        ▼
+[Vector store]  local (default)  |  Chroma  |  Pinecone
+        │
+        ▼
+┌────────────────── LangGraph ──────────────────┐
+│  retrieve  (dense cosine + lexical / RRF)     │
+│      │                                        │
+│      ▼                                        │
+│  grade_relevance                              │
+│     / \                                       │
+│    /   \ out of scope → refuse → END          │
+│   ▼                                           │
+│  generate  (NVIDIA NIM, or extractive fallback)│
+│      │                                        │
+│      ▼                                        │
+│  check_grounding  (numbers, sentences, pages) │
+│     / \                                       │
+│    /   \ ungrounded → correct_answer          │
+│   ▼                                           │
+│  finalize  +  citation sanitizer              │
+└───────────────────────────────────────────────┘
+        │
+        ├── Streamlit UI   (`streamlit run app.py`)
+        └── FastAPI        (`python run_api.py`)
 ```
+
+### Grounding rules
+
+- Answers must be supported by retrieved chunks (token overlap + claim numbers).
+- Page citations that were not retrieved are stripped.
+- Out-of-scope questions get a fixed refusal: the PDF does not contain enough information.
+- Without an NVIDIA key, generation is extractive from the retrieved text (no invented facts).
 
 ---
 
-## 🚀 Quick Start
+## Project layout
 
-### 1. Installation
+| Path | Role |
+|---|---|
+| `app.py` | Streamlit UI: upload, index, chat, confidence, chunks, figures |
+| `api.py` | FastAPI: `/upload`, `/chat`, `/ingest`, `/document`, `/health` |
+| `run_api.py` | Server runner with Windows port-conflict fallback |
+| `document_session.py` | Active-PDF session; blocks chat until ingest succeeds |
+| `ingestion.py` | Extract, chunk, embed, store; tables and images |
+| `rag_pipeline.py` | LangGraph RAG graph + faithfulness checks |
+| `config.py` | Env-driven settings (NVIDIA, vector DB, chunking) |
+| `tests/` | Unit, API, upload-gate, any-PDF grounding, port runner |
 
-Install all required dependencies:
+Runtime data (gitignored): `.uploads/`, `.vector_cache/`, `.chroma_db/`, `.pdf_assets/`.
+
+---
+
+## Quick start
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 2. Environment Configuration
-
-Copy the sample environment file:
-
-```bash
 cp .env.example .env
 ```
 
-Set these in `.env` (NVIDIA is the **only** LLM provider):
-- `NVIDIA_API_KEY` — from [build.nvidia.com](https://build.nvidia.com)
-- `NVIDIA_CHAT_MODEL=meta/llama-3.2-11b-vision-instruct`
-- `NVIDIA_EMBEDDING_MODEL=nvidia/nemotron-3-embed-1b`
-- `VECTOR_DB_TYPE=local` (Options: `local`, `chroma`, `pinecone`)
+Edit `.env`:
 
----
+```bash
+NVIDIA_API_KEY=nvapi-...          # optional; from https://build.nvidia.com
+NVIDIA_CHAT_MODEL=meta/llama-3.2-11b-vision-instruct
+NVIDIA_EMBEDDING_MODEL=nvidia/nemotron-3-embed-1b
+VECTOR_DB_TYPE=local              # local | chroma | pinecone
+```
 
-## 🌲 Vector Database Setup
+NVIDIA is the only hosted LLM / embedding provider. Without a key, embeddings and answers use the local models.
 
-### 1. Where and How to Get Pinecone (Cloud Serverless)
-If you want to use cloud-hosted Pinecone:
-1. **Sign Up**: Go to [https://www.pinecone.io](https://www.pinecone.io) and register for a free account.
-2. **Starter Tier**: Pinecone's Starter plan is **100% free forever** with **1 Serverless project** and up to **100,000 vectors** (AWS `us-east-1`), with **no credit card required**.
-3. **Get Your API Key**:
-   - In the Pinecone console, go to **API Keys** in the left sidebar.
-   - Copy your key and paste it into `.env`:
-     ```bash
-     PINECONE_API_KEY=your-pinecone-api-key-here
-     PINECONE_INDEX_NAME=agentic-ai-index
-     PINECONE_ENVIRONMENT=us-east-1
-     ```
-   - Alternatively, enter it directly into the Streamlit UI sidebar.
-4. **Auto-Provision**: The chatbot will automatically validate dimensions and create the serverless index for you upon first ingest!
-
-### 2. Fast Serverless / Embedded Vector DBs (No Account Needed)
-If you do not want to create a cloud account or wait for Pinecone:
-- ⚡ **Local Fast Vector Store (Default)**:
-  - Built directly into `ingestion.py`.
-  - Serializes normalized embeddings with sub-millisecond cosine similarity into `.vector_cache/local_vector_cache.pkl`.
-  - Zero latency, zero cloud dependencies, instant startup.
-- 🟣 **ChromaDB (Embedded Serverless)**:
-  - Built-in persistent vector database running locally in `.chroma_db/`.
-  - Simply select `ChromaDB` from the dropdown in the UI or set `VECTOR_DB_TYPE=chroma` in `.env`.
-
----
-
-## 🟢 NVIDIA NIM Models (build.nvidia.com / try.nvidia.com)
-
-The assistant natively supports NVIDIA's catalog of hosted NIM models using `langchain-nvidia-ai-endpoints`:
-- **Active Chat Models**:
-  - `meta/llama-3.2-11b-vision-instruct` (Default — extremely fast, responsive)
-  - `nvidia/nemotron-3.5-lightning-30b-a3b`
-  - `nvidia/nemotron-3-super-120b-a12b`
-  - `google/gemma-4-31b-it`
-  - `openai/gpt-oss-20b`
-- **Active Embedding Models**:
-  - `nvidia/nemotron-3-embed-1b` (2048 dimensions)
-  - `nvidia/llama-nemotron-embed-vl-1b-v2` (2048 dimensions)
-
----
-
-### 3. Run Streamlit UI
+### Streamlit
 
 ```bash
 streamlit run app.py
 ```
 
-Features in the UI:
-- **Vector DB Selector**: Switch between Local Fast Cache, ChromaDB, and Pinecone Serverless with 1 click.
-- **NVIDIA NIM**: Chat model picker and API key (OpenAI/Groq are not supported).
-- **Visual Confidence Score**: Color-coded confidence percentage (Green/Yellow/Red).
-- **Retrieved Chunks Inspector**: Expandable cards displaying source page numbers, similarity scores, and excerpts.
-- **Quick Sample Questions**: Pre-configured prompts to test book-specific topics instantly.
+1. Sidebar → **Upload PDF** → **Index uploaded PDF**.
+2. Ask a question. Sample prompts are generic (`What is this document about?`).
+3. Expand retrieved chunks to see page, similarity, and excerpt. Figures render inline.
 
-### 4. Run FastAPI Backend
+### FastAPI
 
-#### Option A: Robust Runner with Auto-Fallback (Recommended)
-Automatically detects if port 8000 is occupied or blocked by Windows `[WinError 10013]`, identifies the conflicting PID, prints kill commands, and seamlessly switches to an available port (e.g. 8001, 8080, 8502):
 ```bash
 python run_api.py
 ```
-Or directly via `api.py`:
+
+`run_api.py` binds `127.0.0.1:8000` when free. On Windows `[WinError 10013]` or a busy port it prints the conflicting PID and falls back to `8001`, `8080`, `8502`, …
+
 ```bash
-python api.py
-```
-Custom host, port, and behavior flags are fully supported on both scripts:
-```bash
-# Custom port and host
 python run_api.py --port 8001 --host 127.0.0.1
-
-# Disable reload in production or background runs
 python run_api.py --no-reload
-
-# Enforce strict port binding without automatic fallback (fails fast if occupied)
 python run_api.py --port 8000 --no-fallback
 ```
 
-#### Option B: Standard Uvicorn Command
-If running via standard uvicorn, specify an available port:
+Docs: `http://127.0.0.1:<PORT>/docs` (root `/` redirects there).
+
 ```bash
-uvicorn api:app --reload --port 8001
-```
+# 1. Upload (required)
+curl -X POST "http://127.0.0.1:8001/upload" -F "file=@your.pdf"
 
-Interactive API documentation available at: `http://127.0.0.1:<PORT>/docs` (e.g., `http://127.0.0.1:8001/docs`)
-
-#### 🛠️ Troubleshooting: Windows `[WinError 10013]` on Port 8000
-If you encounter `ERROR: [WinError 10013] An attempt was made to access a socket in a way forbidden by its access permissions`, port 8000 is either occupied by another process (such as an existing background uvicorn server) or reserved by Windows:
-
-1. **Automatic Detection:**
-   Running `python run_api.py` automatically inspects the TCP table, prints the exact conflicting PID and process name (e.g., `PID 18408 (python.exe)`), and switches to port 8001.
-
-2. **Identify the process manually:**
-   ```cmd
-   netstat -ano | findstr :8000
-   ```
-   Or in PowerShell:
-   ```powershell
-   Get-NetTCPConnection -LocalPort 8000
-   ```
-
-3. **Terminate the conflicting process (replace `<PID>` with the actual PID):**
-   ```cmd
-   taskkill /PID <PID> /F
-   ```
-   Or in PowerShell:
-   ```powershell
-   Stop-Process -Id <PID> -Force
-   ```
-
-4. **Check Windows reserved/excluded port ranges (Hyper-V / WSL):**
-   ```cmd
-   netsh interface ipv4 show excludedportrange protocol=tcp
-   ```
-
-5. **Or simply run on an alternative open port:**
-   ```bash
-   python run_api.py
-   # or
-   uvicorn api:app --reload --port 8001
-   ```
-
-#### Sample Chat Request:
-```bash
+# 2. Chat
 curl -X POST "http://127.0.0.1:8001/chat" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "question": "What is an AI Agent according to the ebook?",
-       "top_k": 2,
-       "nvidia_model": "meta/llama-3.2-11b-vision-instruct"
-     }'
+  -H "Content-Type: application/json" \
+  -d '{"question": "What is this document about?", "top_k": 4}'
 ```
-
 
 ---
 
-## 🧪 Automated Testing
+## HTTP API
 
-To run the automated test suite:
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/` | Redirects to `/docs` |
+| `GET` | `/health` | Service status, `document_ready`, indexed chunk count, NVIDIA flags |
+| `GET` | `/document` | Active upload metadata, or the “upload first” detail |
+| `POST` | `/upload` | Multipart PDF. Indexes immediately. Chat stays locked until this succeeds |
+| `POST` | `/chat` | JSON `{ question, top_k, … }`. **409** if no PDF is ready |
+| `POST` | `/ingest` | Re-index the **already uploaded** PDF. Client `pdf_path` is ignored. **409** if none |
+
+`/chat` response includes `answer`, `retrieved_chunks`, `confidence_score`, `grounded`, `citations`, `tables`, and `images`.
+
+Upload rules: PDF only, `%PDF` magic bytes, empty files rejected, default 50 MB cap (`MAX_UPLOAD_BYTES`), filenames sanitized into `.uploads/` (no path escape).
+
+---
+
+## Vector stores
+
+**Local (default)** — in-process cosine search, persisted at `.vector_cache/local_vector_cache.pkl`. Cache key includes PDF hash, embedding provider/model, and schema version `v4-upload-required`.
+
+**Chroma** — embedded DB in `.chroma_db/`. Set `VECTOR_DB_TYPE=chroma` or pick it in the UI.
+
+**Pinecone** — serverless cloud. Free starter at [pinecone.io](https://www.pinecone.io). Set:
 
 ```bash
-python -m pytest -v tests/test_rag.py
+PINECONE_API_KEY=...
+PINECONE_INDEX_NAME=rag-pdf-index
+PINECONE_ENVIRONMENT=us-east-1
+VECTOR_DB_TYPE=pinecone
 ```
 
-Includes 15 automated unit and integration tests:
-- Unicode text cleaning and ligature normalization
-- PDF page extraction and metadata preservation
-- Document chunking consistency
-- Cosine similarity ranking and score boundary validation
-- LangGraph grounded RAG pipeline execution
-- Conditional out-of-scope question routing
-- Self-correction activation on ungrounded generation
-- FastAPI endpoints (`/health`, `/chat`, `/ingest`)
-- NVIDIA NIM Chat model live invocation
-- NVIDIA NIM Embeddings dimension & vector verification
-- ChromaDB embedded serverless vector storage and retrieval
-- FastAPI NVIDIA end-to-end chat endpoint
+The ingest path creates/validates the index dimension to match the embedding model.
+
+---
+
+## NVIDIA NIM
+
+Chat models (UI picker; any catalog id via “Custom…”):
+
+- `meta/llama-3.2-11b-vision-instruct` (default)
+- `nvidia/nemotron-3.5-lightning-30b-a3b`
+- `meta/llama-3.3-70b-instruct`
+- `nvidia/nemotron-3-super-120b-a12b`
+- `google/gemma-4-31b-it`
+- `openai/gpt-oss-20b`
+
+Embeddings: `nvidia/nemotron-3-embed-1b` (2048-d) or local `all-MiniLM-L6-v2` (384-d).
+
+---
+
+## Tests
+
+```bash
+python -m pytest -v tests/
+```
+
+Coverage includes:
+
+- Upload gate: no chat / ingest / retrieval without a PDF; reject non-PDF, empty, spoofed, and path-escape uploads
+- Any PDF: answers from the correct page, refuse outside facts, unicode, citation subset of retrieved pages
+- Ingestion: text cleaning, chunk metadata, tables as markdown, figures
+- Retrieval: cosine ranking bounds, hybrid lexical fusion, Chroma
+- LangGraph: grounded generate, out-of-scope, self-correction
+- Faithfulness: invented numbers and slipped-in sentences fail
+- FastAPI `/health`, `/chat`, `/ingest`, `/upload`
+- `run_api.py` port detection and fallback (including occupied 8000)
+- NVIDIA NIM chat/embed live tests (skipped or resilient when no key)
+
+Session fixture indexes the sample ebook into the upload session so RAG tests have a corpus. Tests that assert the gate use the `without_document` fixture.
+
+---
+
+## Windows port 8000 (`WinError 10013`)
+
+`python run_api.py` already detects this and switches ports. Manually:
+
+```powershell
+Get-NetTCPConnection -LocalPort 8000
+Stop-Process -Id <PID> -Force
+netsh interface ipv4 show excludedportrange protocol=tcp
+```
+
+---
+
+## Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VECTOR_DB_TYPE` | `local` | `local` / `chroma` / `pinecone` |
+| `NVIDIA_API_KEY` | empty | NIM key; empty → local embeddings + extractive answers |
+| `NVIDIA_CHAT_MODEL` | `meta/llama-3.2-11b-vision-instruct` | Chat model id |
+| `NVIDIA_EMBEDDING_MODEL` | `nvidia/nemotron-3-embed-1b` | Hosted embedding model |
+| `LOCAL_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Offline embeddings |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `800` / `100` | Splitter |
+| `TOP_K_RETRIEVAL` | `4` | Chunks returned after retrieve + grade |
+| `RELEVANCE_THRESHOLD` | `0.45` | Minimum score to treat a hit as in-scope |
+| `MAX_UPLOAD_BYTES` | `50MB` | Upload size cap |
+
+Streamlit file watching is off (`.streamlit/config.toml`) so Torch/Transformers import cycles do not restart the app.

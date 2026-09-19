@@ -1,7 +1,4 @@
-"""
-Streamlit Web Application for the Agentic AI Knowledge Assistant.
-Powered by LangGraph, Pinecone, and strictly grounded on 'Ebook-Agentic-AI.pdf'.
-"""
+"""Streamlit UI: upload a PDF, then ask questions grounded in that file."""
 
 import os
 import html
@@ -30,8 +27,8 @@ from document_session import (
 
 # Page configuration
 st.set_page_config(
-    page_title="Agentic AI Assistant | LangGraph + Pinecone",
-    page_icon="🤖",
+    page_title="PDF Q&A",
+    page_icon="📄",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -171,7 +168,7 @@ with st.sidebar:
         index=0
     )
     if model_selection == "Custom...":
-        nvidia_model_input = st.text_input("Custom NVIDIA Model ID", value="meta/llama-3.2-11b-vision-instruct")
+        nvidia_model_input = st.text_input("Custom NVIDIA Model ID", value=config.DEFAULT_NVIDIA_CHAT_MODEL)
     else:
         nvidia_model_input = model_selection
 
@@ -256,14 +253,7 @@ with st.sidebar:
         st.warning(NO_DOCUMENT_DETAIL)
 
     st.markdown("---")
-    st.markdown("""
-    **LangGraph RAG Architecture:**
-    - **Step 1: Retrieval** — Pinecone Serverless / ChromaDB / Local cosine ranking.
-    - **Step 2: Grade Relevance** — Noise filtering & query thresholding.
-    - **Step 3: Grounded Generation** — NVIDIA NIM, strictly grounded.
-    - **Step 4: Self-Correction** — Verification of lexical overlap & citations.
-    - **Response Contract** — Final Answer + Chunks + Confidence Score.
-    """)
+    st.caption("Answers are taken from retrieved PDF pages only. Each answer lists those page numbers.")
 
     if st.button("🗑️ Clear Chat History", use_container_width=True):
         st.session_state.messages = []
@@ -271,8 +261,8 @@ with st.sidebar:
         st.rerun()
 
 # Main Header
-st.title("🤖 RAG Knowledge Assistant")
-st.caption("Upload a PDF, then ask questions grounded only in that file. NVIDIA NIM + LangGraph.")
+st.title("PDF Q&A")
+st.caption("Upload a PDF. Questions are answered only from that file, with page citations.")
 
 if not is_document_ready():
     st.error(NO_DOCUMENT_DETAIL)
@@ -283,15 +273,12 @@ active_meta = get_active_document() or {}
 st.caption(f"Grounded on **{active_meta.get('filename', 'uploaded.pdf')}**.")
 
 # Example Prompt Quick Buttons
-st.markdown("**Quick questions to explore:**")
-quick_cols = st.columns(4)
+st.markdown("**Try:**")
+quick_cols = st.columns(2)
 quick_prompts = [
-    "What is an AI Agent according to the ebook?",
-    "Compare Traditional AI, Non-agentic AI, Agentic AI and Generative AI in a table",
-    "Show the diagram comparing LLMs and Agents",
-    "What enterprise use cases are highlighted in the book?"
+    "What is this document about? Cite pages.",
+    "List the main points with page numbers.",
 ]
-
 for i, col in enumerate(quick_cols):
     if col.button(quick_prompts[i], key=f"quick_{i}", use_container_width=True):
         st.session_state.pending_query = quick_prompts[i]

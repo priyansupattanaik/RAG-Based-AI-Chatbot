@@ -29,9 +29,9 @@ from document_session import (
 )
 
 app = FastAPI(
-    title="Agentic AI RAG API",
-    description="Knowledge-grounded Question Answering API for 'Agentic AI: An Executive's Guide' ebook using LangGraph & Pinecone.",
-    version="1.1.0"
+    title="PDF Q&A API",
+    description="Upload a PDF, then ask questions grounded in that file. Answers include page citations.",
+    version="1.2.0"
 )
 
 # Enable CORS for cross-origin frontend clients

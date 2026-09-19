@@ -48,26 +48,6 @@ from rag_pipeline import (
 from api import app
 
 
-@pytest.fixture(scope="session", autouse=True)
-def setup_ingestion():
-    """Index the ebook through the same upload path the UI/API use."""
-    pdf_bytes = Path(config.DEFAULT_PDF_PATH).read_bytes()
-    state = save_uploaded_pdf("Ebook-Agentic-AI.pdf", pdf_bytes)
-    res = ingest_pipeline(
-        pdf_path=state["path"],
-        embedding_provider="local",
-        use_pinecone=False,
-        force_reindex=False,
-    )
-    mark_ingested(res["total_pages"], res["total_chunks"], res.get("target_store", ""))
-
-
-@pytest.fixture
-def extractive_only(monkeypatch):
-    """Skip NVIDIA LLM calls so unit tests use the extractive synthesizer."""
-    monkeypatch.setattr("rag_pipeline.get_llm", lambda **kwargs: None)
-
-
 def test_clean_text():
     """Verify unicode normalization and ligature cleanup."""
     raw = "transfor-\nmative AI\u0562s systems \ufffd and\n\n\n\nmultiple lines"
@@ -410,8 +390,7 @@ def test_faithfulness_rejects_invented_numbers_and_facts():
     assert is_answer_faithful(grounded, chunks) is True
 
     oos = (
-        "The provided PDF ebook ('Agentic AI: An Executive's Guide') does not contain sufficient "
-        "relevant information to answer this question."
+        "The uploaded PDF does not contain sufficient relevant information to answer this question."
     )
     assert is_answer_faithful(oos, chunks) is True
     mixed = oos + " Agentic AI will replace all human CEOs by 2027."

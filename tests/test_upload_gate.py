@@ -21,31 +21,6 @@ from api import app
 from ingestion import set_active_vector_store, get_active_vector_store, ingest_pipeline
 
 
-@pytest.fixture
-def without_document():
-    """Temporarily clear the uploaded corpus, then restore session-level state."""
-    prev_state = ds.get_active_document()
-    prev_store = get_active_vector_store(embedding_provider="local")
-    ds.clear_active_document()
-    set_active_vector_store(None)
-    yield
-    if prev_state:
-        ds._write_state(prev_state)
-        if prev_store is not None:
-            set_active_vector_store(prev_store)
-        else:
-            from ingestion import ingest_pipeline
-            res = ingest_pipeline(
-                pdf_path=prev_state["path"],
-                embedding_provider="local",
-                use_pinecone=False,
-                force_reindex=False,
-            )
-            ds.mark_ingested(res["total_pages"], res["total_chunks"], res.get("target_store", ""))
-    else:
-        set_active_vector_store(prev_store)
-
-
 def test_chat_blocked_without_upload_bug_r_upload_gate(without_document):
     """BUG-R1: /chat must not answer if no PDF was uploaded."""
     client = TestClient(app)

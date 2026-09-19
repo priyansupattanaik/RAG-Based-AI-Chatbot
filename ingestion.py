@@ -13,7 +13,7 @@ import logging
 import unicodedata
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 import pymupdf
 import numpy as np
 
@@ -361,16 +361,20 @@ def _is_real_table(rows: List[List[Any]]) -> bool:
     return True
 
 
-def _page_heading(page) -> str:
+def _page_heading(page, running_headers: Optional[Set[str]] = None) -> str:
     text = clean_text(page.get_text("text") or "")
+    running = running_headers or set()
     for line in text.splitlines():
         stripped = line.strip()
-        if 8 <= len(stripped) <= 90 and not stripped.lower().startswith("agentic ai for executives"):
+        if 8 <= len(stripped) <= 90:
+            sl = stripped.lower()
+            if any(sl == h or sl.startswith(h) or h.startswith(sl) for h in running):
+                continue
             return stripped
     return f"Page {page.number + 1} figure"
 
 
-def extract_tables_and_media(pdf_path: str = str(config.DEFAULT_PDF_PATH)) -> Tuple[List[Document], List[Document], Dict[str, Any]]:
+def extract_tables_and_media(pdf_path: str) -> Tuple[List[Document], List[Document], Dict[str, Any]]:
     """
     Extract markdown tables and visual figures from the PDF.
     Vector diagrams (drawings) are rendered as page figures when no large raster exists.
@@ -385,9 +389,23 @@ def extract_tables_and_media(pdf_path: str = str(config.DEFAULT_PDF_PATH)) -> Tu
     manifest: Dict[str, Any] = {"tables": [], "images": []}
 
     with pymupdf.open(pdf_path) as doc:
+        # Dynamically detect recurring running headers/footers across pages
+        line_counts: Dict[str, int] = {}
+        for p in doc:
+            for line in (p.get_text("text") or "").splitlines():
+                s = line.strip()
+                if 8 <= len(s) <= 90:
+                    line_counts[s] = line_counts.get(s, 0) + 1
+        threshold_count = max(2, int(len(doc) * 0.35))
+        running_headers = {
+            line.lower() for line, count in line_counts.items() if count >= threshold_count
+        }
+        doc_stem = Path(pdf_path).stem.lower().replace("-", " ").replace("_", " ")
+        running_headers.add(doc_stem)
+
         for page_index, page in enumerate(doc):
             page_num = page_index + 1
-            heading = _page_heading(page)
+            heading = _page_heading(page, running_headers)
             page_text = clean_text(page.get_text("text") or "")
 
             try:
@@ -534,7 +552,7 @@ def load_asset_manifest() -> Dict[str, Any]:
         return {"tables": [], "images": []}
 
 
-def extract_text_from_pdf(pdf_path: str = str(config.DEFAULT_PDF_PATH)) -> List[Document]:
+def extract_text_from_pdf(pdf_path: str) -> List[Document]:
     """
     Extract text page by page from the PDF file with clean metadata.
     """
@@ -603,7 +621,7 @@ def chunk_documents(
                     metadata={
                         "page": page_num,
                         "chunk_id": f"p{page_num}_c{i+1}",
-                        "source": doc.metadata.get("source", "Ebook-Agentic-AI.pdf"),
+                        "source": doc.metadata.get("source") or "uploaded.pdf",
                         "index": chunk_counter,
                         "content_type": doc.metadata.get("content_type", "text"),
                     }
@@ -673,7 +691,7 @@ def store_in_chroma(
     chunks: List[Document],
     embeddings,
     persist_directory: Path = config.CHROMA_PERSIST_DIR,
-    collection_name: str = "agentic_ai_chunks",
+    collection_name: str = config.CHROMA_COLLECTION_NAME,
     embedding_provider: str = "local",
     nvidia_model: Optional[str] = None
 ):
@@ -721,7 +739,7 @@ def store_in_chroma(
 def connect_chroma(
     embeddings = None,
     persist_directory: Path = config.CHROMA_PERSIST_DIR,
-    collection_name: str = "agentic_ai_chunks",
+    collection_name: str = config.CHROMA_COLLECTION_NAME,
     embedding_provider: Optional[str] = None,
     nvidia_api_key: Optional[str] = None,
     nvidia_model: Optional[str] = None

@@ -1,12 +1,4 @@
-"""
-LangGraph-based RAG pipeline for the 'Agentic AI: An Executive's Guide' ebook.
-Implements:
-1. Document retrieval from Pinecone (or cached local vector store)
-2. Relevance grading of context chunks with threshold filtering
-3. Grounded generation using NVIDIA NIM or a structured extractive fallback
-4. Hallucination detection & self-correction via conditional graph routing
-5. Structured response returning: final answer, retrieved context chunks, confidence score.
-"""
+"""Retrieve PDF chunks, answer only from those chunks, cite their page numbers."""
 
 import math
 import re
@@ -24,11 +16,10 @@ logger = logging.getLogger("rag_pipeline")
 logging.basicConfig(level=logging.INFO)
 
 OUT_OF_SCOPE_ANSWER = (
-    "The provided PDF ebook ('Agentic AI: An Executive's Guide') does not contain sufficient "
-    "relevant information to answer this question.\n\n"
-    "Please ask a question related to Agentic AI, autonomous workflows, multi-agent collaboration, "
-    "enterprise architecture, or executive readiness as covered in the book."
+    "The uploaded PDF does not contain sufficient relevant information to answer this question."
 )
+
+_PAGE_CITE = re.compile(r"\[Page\s+(\d+)\]", re.IGNORECASE)
 
 _STOPWORDS: Set[str] = {
     "about", "after", "also", "been", "being", "does", "from", "have", "into",
@@ -38,8 +29,8 @@ _STOPWORDS: Set[str] = {
     "while", "with", "would", "your", "the", "and", "for", "are", "but",
     "not", "you", "all", "can", "her", "was", "one", "our", "out", "how",
     "who", "why", "did", "its", "has", "had", "his", "she", "any", "few",
-    "according", "ebook", "page", "score", "extracted", "directly", "referenced",
-    "current", "price", "tomorrow", "today", "described",
+    "according", "page", "score", "extracted", "directly", "referenced",
+    "described",
 }
 
 
@@ -51,7 +42,7 @@ def _stem(token: str) -> str:
 
 
 def _content_tokens(text: str) -> List[str]:
-    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9%]{2,}", (text or "").lower())
+    tokens = re.findall(r"[^\W\d_][\w%]{1,}", (text or "").lower())
     return [_stem(t) for t in tokens if t not in _STOPWORDS]
 
 
@@ -74,9 +65,12 @@ def _lexical_overlap(question: str, text: str) -> float:
 
 def _extract_claim_numbers(text: str) -> List[str]:
     """Numbers that are factual claims, excluding citations and retrieval scores."""
-    stripped = re.sub(r"\[?Page\s+\d+\]?", " ", text, flags=re.IGNORECASE)
+    stripped = re.sub(r"\[?Pages?\s+[\d,\s\-and]+\]?", " ", text, flags=re.IGNORECASE)
+    stripped = re.sub(r"\(Pages?\s+[\d,\s\-and]+\)", " ", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\bPages?\s+\d+\b", " ", stripped, flags=re.IGNORECASE)
     stripped = re.sub(r"similarity score\s+[0-9.]+", " ", stripped, flags=re.IGNORECASE)
-    return re.findall(r"\d+(?:\.\d+)?%?", stripped)
+    raw = re.findall(r"\b\d+(?:,\d+)*(?:\.\d+)?%?\b", stripped)
+    return [n.replace(",", "") for n in raw]
 
 
 def _normalize_ws(text: str) -> str:
@@ -86,8 +80,9 @@ def _normalize_ws(text: str) -> str:
 def _is_refusal(answer: str) -> bool:
     compact = re.sub(r"\s+", " ", (answer or "").strip().lower())
     canned = re.sub(r"\s+", " ", OUT_OF_SCOPE_ANSWER.strip().lower())
-    first = canned.split("please ask")[0].strip()
-    if compact == canned or compact == first:
+    if compact == canned:
+        return True
+    if compact.startswith(canned) and len(compact) < len(canned) + 8:
         return True
     return False
 
@@ -97,7 +92,7 @@ def is_answer_faithful(answer: str, chunks: List[Dict[str, Any]]) -> bool:
     True only if the answer is supported by retrieved chunks:
     - exact out-of-scope refusals are faithful
     - every claim number must appear in the retrieved text
-    - each remaining sentence must be a context span or high token overlap
+    - every substantive sentence must be a context span or high token overlap
     """
     if not answer:
         return False
@@ -117,7 +112,8 @@ def is_answer_faithful(answer: str, chunks: List[Dict[str, Any]]) -> bool:
     context_tokens = set(_content_tokens(context))
 
     for num in _extract_claim_numbers(answer):
-        if num not in context_nums and num not in context:
+        norm_num = num.replace(",", "")
+        if norm_num not in context_nums:
             return False
 
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer) if len(s.strip()) > 20]
@@ -127,29 +123,37 @@ def is_answer_faithful(answer: str, chunks: List[Dict[str, Any]]) -> bool:
             return False
         return all(t in context_tokens for t in tokens)
 
-    supported = 0
     for sentence in sentences:
         sl = sentence.lower()
         if "self-correction applied" in sl or "extracted directly from referenced" in sl:
-            supported += 1
             continue
-        header_tokens = set(_content_tokens(sentence)) - {"agentic"}
-        if sl.startswith("according to the") and "ebook" in sl and re.search(r"page\s+\d+", sl) and not header_tokens:
-            supported += 1
+        if sl.startswith("**from [page") or sl.startswith("from [page"):
             continue
+        if re.search(r"page\s+\d+", sl):
+            if sl.startswith("from the uploaded pdf"):
+                continue
+            if sl.startswith(("according to", "from the uploaded", "based on", "as stated in")):
+                from document_session import get_active_document
+                active_doc = get_active_document() or {}
+                doc_terms = set(_content_tokens(active_doc.get("filename", "")))
+                preamble_tokens = set(_content_tokens(sentence)) - {
+                    "document", "pdf", "file", "text", "source", "uploaded", "ebook", "reference", "page"
+                } - doc_terms
+                if not preamble_tokens:
+                    continue
         if _normalize_ws(sentence) in context_norm:
-            supported += 1
             continue
         tokens = _content_tokens(sentence)
         if len(tokens) < 3:
             continue
         if all(t in context_tokens for t in tokens):
-            supported += 1
             continue
         overlap = sum(1 for t in tokens if t in context_tokens)
         if (overlap / len(tokens)) >= 0.70:
-            supported += 1
-    return sentences and (supported / len(sentences)) >= 0.85
+            continue
+        # Unsubstantiated sentence detected
+        return False
+    return True
 
 
 def _lexical_search_store(store, question: str, k: int) -> List[tuple]:
@@ -232,13 +236,25 @@ def _expand_same_page_chunks(store, results: List[tuple], max_per_page: int = 3)
 
 
 def _missing_proper_nouns(question: str, chunks: List[Dict[str, Any]]) -> List[str]:
-    proper = re.findall(r"\b[A-Z][a-zA-Z]{3,}\b", question or "")
+    proper = [w for w in re.findall(r"\b[\w]{3,}\b", question or "") if w[0].isupper()]
     skip = {
-        "What", "When", "Where", "Which", "This", "That", "Agentic", "Executive", "Guide",
-        "Compare", "Show", "Describe", "Explain", "List", "Give", "Tell", "Does", "How",
-        "Who", "Why", "Please", "Could", "Would", "Should", "From", "With", "About",
-        "Traditional", "Generative", "Non",
+        "What", "When", "Where", "Which", "This", "That", "These", "Those",
+        "Compare", "Show", "Describe", "Explain", "List", "Give", "Tell", "Does",
+        "How", "Who", "Whom", "Whose", "Why", "Please", "Could", "Would", "Should",
+        "From", "With", "About", "Into", "Under", "Over", "Between", "Among",
+        "Have", "Having", "Been", "Being", "Were", "Will", "State", "Define",
+        "Find", "Detail", "Outline", "Summarize", "Identify", "Provide", "Can",
+        "According", "Based", "Table", "Figure", "Check", "Also", "Make", "Name",
+        "Is", "Are", "Was", "Do", "Did", "May", "Might", "Must", "Shall",
+        "In", "On", "At", "By", "For", "To", "If", "As", "Quel", "Quelle",
+        "Quels", "Quelles", "Comment", "Pourquoi", "Combien", "Quand", "Cual",
     }
+    from document_session import get_active_document
+    active_doc = get_active_document() or {}
+    for term in re.findall(r"[\w]{3,}", active_doc.get("filename", "")):
+        skip.add(term)
+        skip.add(term.capitalize())
+        skip.add(term.upper())
     context = " ".join(c.get("text", "") for c in chunks).lower()
     missing = []
     for noun in proper:
@@ -247,6 +263,35 @@ def _missing_proper_nouns(question: str, chunks: List[Dict[str, Any]]) -> List[s
         if noun.lower() not in context and _stem(noun.lower()) not in context:
             missing.append(noun)
     return missing
+
+
+def _get_corpus_frequent_terms(chunks: List[Dict[str, Any]], threshold_ratio: float = 0.60) -> Set[str]:
+    if not chunks:
+        return set()
+    chunk_token_sets = [set(_content_tokens(c.get("text", ""))) for c in chunks]
+    all_terms = set().union(*chunk_token_sets) if chunk_token_sets else set()
+    corpus_terms = set()
+    min_count = max(2, int(len(chunks) * threshold_ratio))
+    for t in all_terms:
+        if sum(1 for cts in chunk_token_sets if t in cts) >= min_count:
+            corpus_terms.add(t)
+    return corpus_terms
+
+
+def _distinctive_inquiry_terms(question: str, chunks: List[Dict[str, Any]]) -> Set[str]:
+    meta_terms = {
+        "document", "pdf", "page", "section", "chapter", "text", "file",
+        "information", "content", "mention", "mentioned", "describe", "described",
+        "state", "stated", "detail", "details", "explain", "explained",
+        "according", "ebook", "guide", "paper", "book", "report",
+    }
+    from document_session import get_active_document
+    active_doc = get_active_document() or {}
+    doc_terms = set(_content_tokens(active_doc.get("filename", "")))
+    corpus_terms = _get_corpus_frequent_terms(chunks)
+    generic = meta_terms | doc_terms | corpus_terms
+    q_tokens = set(_query_terms(question))
+    return {t for t in q_tokens - generic if len(t) >= 4}
 
 
 def _is_table_question(question: str) -> bool:
@@ -331,9 +376,11 @@ def format_citations(chunks: List[Dict[str, Any]], tables: Optional[List[Dict[st
     pages = sorted({int(c["page"]) for c in chunks if c.get("page") is not None})
     if not pages:
         return ""
-    source_name = "uploaded.pdf"
+    from document_session import get_active_document
+    active_doc = get_active_document() or {}
+    source_name = active_doc.get("filename") or "uploaded.pdf"
     for chunk in chunks:
-        if chunk.get("source"):
+        if chunk.get("source") and chunk.get("source") != "uploaded.pdf":
             source_name = str(chunk["source"])
             break
     lines = [f"- [Page {p}] {source_name}" for p in pages]
@@ -357,13 +404,47 @@ def ensure_citations(answer: str, chunks: List[Dict[str, Any]], tables: Optional
     cite_block = format_citations(chunks, tables, images)
     if not cite_block:
         return answer
-    if "**Citations:**" in answer:
+    body = answer
+    if "**Citations:**" in body:
+        body = body.split("**Citations:**")[0]
+    body = re.sub(r"\nSources:\s*.*$", "", body, flags=re.IGNORECASE).rstrip()
+    return body + "\n\n" + cite_block
+
+
+def retrieved_pages(chunks: List[Dict[str, Any]]) -> Set[int]:
+    pages = set()
+    for chunk in chunks:
+        page = chunk.get("page")
+        if page is None:
+            continue
+        try:
+            pages.add(int(page))
+        except (TypeError, ValueError):
+            continue
+    return pages
+
+
+def sanitize_page_citations(answer: str, chunks: List[Dict[str, Any]]) -> str:
+    """Drop page markers that are not in the retrieved set."""
+    allowed = retrieved_pages(chunks)
+    if not answer:
         return answer
-    if not re.search(r"\[Page\s+\d+", answer, re.IGNORECASE):
-        pages = sorted({int(c["page"]) for c in chunks if c.get("page") is not None})
-        inline = ", ".join(f"[Page {p}]" for p in pages)
-        answer = answer.rstrip() + f"\n\nSources: {inline}"
-    return answer.rstrip() + "\n\n" + cite_block
+
+    pattern = re.compile(
+        r"\[Page\s+(\d+)\]|\(Page\s+(\d+)\)|(?<![A-Za-z])Page\s+(\d+)",
+        re.IGNORECASE,
+    )
+
+    def _keep(match: re.Match) -> str:
+        page = int(next(g for g in match.groups() if g is not None))
+        return match.group(0) if page in allowed else ""
+
+    cleaned = pattern.sub(_keep, answer)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
+def citation_pages_in_answer(answer: str) -> Set[int]:
+    return {int(n) for n in _PAGE_CITE.findall(answer or "")}
 
 
 class RAGState(TypedDict):
@@ -469,7 +550,7 @@ def retrieve_node(state: RAGState) -> Dict[str, Any]:
             "page": doc.metadata.get("page", 1),
             "score": round(normalized_score, 4),
             "text": doc.page_content,
-            "source": doc.metadata.get("source", "Ebook-Agentic-AI.pdf"),
+            "source": doc.metadata.get("source") or "uploaded.pdf",
             "content_type": doc.metadata.get("content_type", "text"),
             "table_markdown": doc.metadata.get("table_markdown"),
             "image_path": doc.metadata.get("image_path"),
@@ -528,6 +609,36 @@ def grade_relevance_node(state: RAGState) -> Dict[str, Any]:
             "context_chunks": [],
             "relevance_score": 0.0
         }
+
+    # Verify that factual numbers/years in question exist in retrieved chunks
+    q_nums = [
+        n.replace(",", "")
+        for n in re.findall(r"\b\d+(?:,\d+)*(?:\.\d+)?%?\b", question)
+        if len(n.rstrip("%")) >= 3 or "%" in n
+    ]
+    if q_nums:
+        all_context = " ".join(c.get("text", "") for c in kept)
+        context_nums = set(_extract_claim_numbers(all_context))
+        if any(n not in context_nums for n in q_nums):
+            return {
+                "is_relevant": False,
+                "context_chunks": [],
+                "relevance_score": 0.0
+            }
+
+    # Verify that distinctive inquiry terms have matches in kept chunks
+    inquiry_terms = _distinctive_inquiry_terms(question, chunks)
+    if inquiry_terms:
+        all_context_l = " ".join(c.get("text", "") for c in kept).lower()
+        context_tokens = set(_content_tokens(all_context_l))
+        matched = {t for t in inquiry_terms if t in context_tokens or t in all_context_l}
+        if not matched:
+            return {
+                "is_relevant": False,
+                "context_chunks": [],
+                "relevance_score": 0.0
+            }
+
     if not kept:
         max_score = max(c["score"] for c in chunks)
         return {
@@ -556,7 +667,7 @@ def decide_to_generate(state: RAGState) -> str:
 
 def handle_out_of_scope_node(state: RAGState) -> Dict[str, Any]:
     """
-    Out-of-Scope Handler: Polite, factual disclaimer when the query is unrelated to the ebook.
+    Out-of-scope handler when retrieved pages do not support the question.
     Eliminates hallucinations by refusing to generate on non-relevant context.
     """
     return {
@@ -575,9 +686,15 @@ def synthesize_extractive_answer(question: str, chunks: List[Dict[str, Any]]) ->
     if not chunks:
         return OUT_OF_SCOPE_ANSWER
 
+    inquiry = _distinctive_inquiry_terms(question, chunks)
+    if inquiry and not any(any(t in c.get("text", "").lower() for t in inquiry) for c in chunks):
+        return OUT_OF_SCOPE_ANSWER
+
     q_tokens = set(_query_terms(question))
-    generic = {"agent", "ai", "use", "case", "system", "execut", "guid", "ebook", "section"}
-    distinctive = {t for t in q_tokens - generic if len(t) >= 5}
+    generic = _get_corpus_frequent_terms(chunks)
+    distinctive = {t for t in q_tokens - generic if len(t) >= 4}
+    if not distinctive:
+        distinctive = {t for t in q_tokens if len(t) >= 4}
     candidates = []
     for chunk in chunks:
         text = chunk["text"].strip()
@@ -606,8 +723,9 @@ def synthesize_extractive_answer(question: str, chunks: List[Dict[str, Any]]) ->
     candidates.sort(reverse=True)
     sections = []
     used_pages: Dict[int, int] = {}
+    min_overlap = 1 if len(q_tokens) <= 2 else 2
     for dist, _pct, overlap, _ln, page_num, snippet in candidates:
-        if dist == 0 and overlap < 2:
+        if dist == 0 and overlap < min_overlap:
             continue
         if used_pages.get(page_num, 0) >= 2:
             continue
@@ -624,22 +742,22 @@ def synthesize_extractive_answer(question: str, chunks: List[Dict[str, Any]]) ->
                 f"**{table.get('caption', 'PDF table')}** [Page {table.get('page')}]\n\n{table['markdown']}"
             )
         if table_parts:
-            pages_cited = sorted({c["page"] for c in chunks[:4]})
+            table_pages = sorted({t["page"] for t in tables[:2] if t.get("page")})
+            pages_cited = table_pages or sorted({c["page"] for c in chunks[:4]})
             page_str = ", ".join(f"Page {p}" for p in pages_cited)
             return (
-                f"According to the **Agentic AI** ebook ({page_str}):\n\n"
+                f"From the uploaded PDF ({page_str}):\n\n"
                 + "\n\n".join(table_parts)
             )
 
     if not sections:
         return OUT_OF_SCOPE_ANSWER
 
-    pages_cited = sorted({c["page"] for c in chunks[:4]})
+    pages_cited = sorted(used_pages.keys())
     page_str = ", ".join(f"Page {p}" for p in pages_cited)
     return (
-        f"According to the **Agentic AI** ebook ({page_str}):\n\n"
+        f"From the uploaded PDF ({page_str}):\n\n"
         + "\n\n".join(sections)
-        + "\n\n*(Extracted directly from referenced PDF pages.)*"
     )
 
 
@@ -660,38 +778,36 @@ def generate_node(state: RAGState) -> Dict[str, Any]:
             table_parts.append(
                 f"**{table.get('caption', 'PDF table')}** [Page {table.get('page')}]\n\n{table['markdown']}"
             )
-        pages_cited = sorted({c["page"] for c in chunks})
+        table_pages = sorted({t["page"] for t in tables[:2] if t.get("page")})
+        pages_cited = table_pages or sorted({c["page"] for c in chunks})
         page_str = ", ".join(f"Page {p}" for p in pages_cited)
         return {
             "answer": (
-                f"According to the **Agentic AI** ebook ({page_str}):\n\n"
+                f"From the uploaded PDF ({page_str}):\n\n"
                 + "\n\n".join(table_parts)
             )
         }
 
     context_lines = []
     for c in chunks:
-        context_lines.append(f"--- [Page {c['page']}] (Score: {c['score']}) ---\n{c['text']}\n")
+        context_lines.append(f"--- [Page {c['page']}] ---\n{c['text']}\n")
     context_text = "\n".join(context_lines)
 
     system_prompt = (
-        "You are a retrieval-grounded assistant for the ebook 'Agentic AI: An Executive's Guide'.\n"
-        "You may use ONLY the context blocks below. They are verbatim excerpts from the PDF.\n\n"
-        "HARD RULES:\n"
-        "1. Every factual sentence must be supported by the context and include a [Page N] citation that appears in that context.\n"
-        "2. Do not invent names, statistics, products, dates, or claims. If a number is not in the context, do not write it.\n"
-        "3. Do not use outside knowledge, even if you know the topic.\n"
-        "4. If the context does not contain the answer, reply with exactly this sentence and nothing else:\n"
-        "The provided PDF ebook ('Agentic AI: An Executive's Guide') does not contain sufficient relevant information to answer this question.\n"
-        "5. Prefer quoting or closely paraphrasing the context over summarizing from memory.\n"
-        "6. If the context contains a markdown table, reproduce that table as a GitHub markdown table. Do not turn table cells into unsupported prose.\n"
-        "7. End with a Citations list of [Page N] values that appear in the context."
+        "Answer the question using only the document excerpts below.\n"
+        "STRICT ANTI-HALLUCINATION RULES:\n"
+        "- Cite each fact as [Page N] using a page number that appears in the excerpts.\n"
+        "- Do not invent, speculate, or extrapolate facts, numbers, dates, names, or pages.\n"
+        "- Never introduce outside knowledge not present in the excerpts.\n"
+        "- If the excerpts do not contain sufficient information to answer the question, reply with exactly:\n"
+        f"{OUT_OF_SCOPE_ANSWER}\n"
+        "- If a markdown table is in the excerpts, copy it as a markdown table."
     )
 
     user_prompt = (
-        f"Context from Ebook:\n{context_text}\n\n"
+        f"Excerpts:\n{context_text}\n\n"
         f"Question: {question}\n\n"
-        "Answer using only the context. Cite [Page N]. If the context is insufficient, use the required refusal sentence."
+        "Answer from the excerpts only. Cite [Page N]."
     )
 
     llm = get_llm(
@@ -760,13 +876,15 @@ def check_grounding_node(state: RAGState) -> Dict[str, Any]:
     if cited_pages:
         valid_citations = [p for p in cited_pages if p in retrieved_pages]
         citation_score = len(valid_citations) / len(cited_pages)
+        has_invalid_citations = (len(valid_citations) < len(cited_pages))
     else:
         citation_score = 0.0
+        has_invalid_citations = False
 
     faithful = is_answer_faithful(answer, chunks)
     raw_confidence = (relevance_score * 0.50) + (word_overlap_ratio * 0.30) + (citation_score * 0.20)
     confidence = min(0.98, max(0.20, round(raw_confidence, 2)))
-    grounded = faithful and (word_overlap_ratio >= 0.40)
+    grounded = faithful and (word_overlap_ratio >= 0.40) and not has_invalid_citations
 
     return {
         "grounded": grounded,
@@ -799,8 +917,7 @@ def correct_answer_node(state: RAGState) -> Dict[str, Any]:
     corrected = synthesize_extractive_answer(question, chunks)
     clarification = (
         f"{corrected}\n\n"
-        "*(Self-Correction Applied: The initial response was refined to ensure 100% adherence "
-        "to the verified text chunks above.)*"
+        "*(Self-Correction Applied: replaced the draft with retrieved excerpts.)*"
     )
 
     return {
@@ -920,7 +1037,8 @@ def query_rag(
     chunks = final_state.get("context_chunks", [])
     tables = collect_tables(chunks)
     images = collect_images(chunks)
-    answer = ensure_citations(final_state.get("answer", ""), chunks, tables, images)
+    answer = sanitize_page_citations(final_state.get("answer", ""), chunks)
+    answer = ensure_citations(answer, chunks, tables, images)
 
     return {
         "question": question,

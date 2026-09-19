@@ -15,11 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import os
 import config
 
 UPLOAD_DIR = Path(config.UPLOAD_DIR)
 STATE_PATH = UPLOAD_DIR / "active.json"
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 _LOCK = threading.Lock()
 NO_DOCUMENT_DETAIL = (
     "No PDF has been uploaded. Upload a PDF first; the assistant will not answer "
